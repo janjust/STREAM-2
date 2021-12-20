@@ -138,8 +138,9 @@ double bench(int op, DTYPE *a, DTYPE *b, DTYPE *c, size_t count, int iters)
 void print_header()
 {
     printf("Compile Flags: %s\n", OPTFLAGS);
-    printf("Element Size: %-3ld ", sizeof(DTYPE));
-    printf("OpenMP Threads: %-3d\n", get_omp_num_threads());
+    printf("Element Size: %ld Bytes    ", sizeof(DTYPE));
+    printf("OpenMP Threads: %d    ", get_omp_num_threads());
+    printf("Reported BW: GByte/s\n");
 
     printf("%-8s %-12s", "Iters", "Bytes");
     for (int op = 0; op < NUM_OPS; op++) {
