@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <sys/time.h>
 
 #define DTYPE double
@@ -84,50 +85,32 @@ void stream_reduce(DTYPE* restrict a, DTYPE* restrict b, DTYPE* restrict c, size
     }
 }
 
-/* Define Stream Operations */
-typedef enum stream_op {
-    COPY,
-    SCALE,
-    ADD,
-    TRIAD,
-    REDUCE,
-    NUM_OPS
-} stream_op;
-
-char op_names[NUM_OPS][10] = {
-    "copy",
-    "scale",
-    "add",
-    "triad",
-    "reduce",
-};
-
-int words_per_op[NUM_OPS] = {
-    2,
-    2,
-    3,
-    3,
-    1,
-};
-
+/* Define Stream Benchmarks */
 typedef void (*stream_fn)(DTYPE*, DTYPE*, DTYPE*, size_t);
-stream_fn stream_fns[NUM_OPS] = {
-    stream_copy,
-    stream_scale,
-    stream_add,
-    stream_triad,
-    stream_reduce,
+
+typedef struct benchmark {
+    char name[10];
+    int  num_vectors;
+    stream_fn fn;
+} benchmark;
+
+benchmark benchmarks[] = {
+    { "copy",   2, stream_copy   },
+    { "scale",  2, stream_scale  },
+    { "add",    3, stream_add    },
+    { "triad",  3, stream_triad  },
+    { "reduce", 1, stream_reduce },
 };
 
 /* Report Raw Latency in Microsecond from Individual Benchmarks */
-double bench(int op, DTYPE *a, DTYPE *b, DTYPE *c, size_t count, int iters)
+double run_bench(stream_fn fn, DTYPE *a, DTYPE *b, DTYPE *c, size_t count, int iters)
 {
     /* Ignore first iteration */
-    (stream_fns[op])(a, b, c, count);
+    (fn)(a, b, c, count);
 
     double t_start = gettimeus();
     for (int j = 0; j < iters; j++) {
-        (stream_fns[op])(a, b, c, count);
+        (fn)(a, b, c, count);
     }
     double t_end = gettimeus();
 
@@ -141,19 +124,20 @@ void print_header()
     printf("Element Size: %ld Bytes    ", sizeof(DTYPE));
     printf("OpenMP Threads: %d    ", get_omp_num_threads());
     printf("Reported BW: GByte/s\n");
-
     printf("%-8s %-12s", "Iters", "Bytes");
-    for (int op = 0; op < NUM_OPS; op++) {
-        printf("%10s", op_names[op]);
+
+    int num_bench = sizeof(benchmarks) / sizeof(benchmarks[0]);
+    for (int i = 0; i < num_bench; i++) {
+        printf("%10s", benchmarks[i].name);
     }
     printf("\n");
 }
 
 int main(int argc, char **argv)
 {
-    size_t pg_size  = 4096;
-    size_t mincount = pg_size / sizeof(DTYPE);
-    size_t maxcount = 128l * 1024 * mincount;
+    size_t pg_size  = sysconf(_SC_PAGESIZE);
+    size_t mincount = (1<<12)  / sizeof(DTYPE);
+    size_t maxcount = (1<<30)  / sizeof(DTYPE);
     size_t maxbytes = maxcount * sizeof(DTYPE);
 
     DTYPE *a = aligned_alloc(pg_size, maxbytes);
@@ -171,10 +155,12 @@ int main(int argc, char **argv)
         int iters = get_num_iters(nbytes);
         printf("%-8d %-12ld", iters, nbytes);
 
-        for (int op = 0; op < NUM_OPS; op++) {
-            double lat_us = bench(op, a, b, c, count, iters);
+        int num_bench = sizeof(benchmarks) / sizeof(benchmarks[0]);
+        for (int i = 0; i < num_bench; i++) {
+            benchmark bench = benchmarks[i];
+            double lat_us = run_bench(bench.fn, a, b, c, count, iters);
             double bw_GBs = 1e-3 * nbytes / lat_us;
-            bw_GBs *= words_per_op[op];
+            bw_GBs *= bench.num_vectors;
             printf("%10.2lf", bw_GBs);
         }
         printf("\n");
@@ -185,3 +171,4 @@ int main(int argc, char **argv)
     free(c);
     return 0;
 }
+

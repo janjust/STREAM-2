@@ -8,6 +8,10 @@ Enhancements include:
  * Auto scaling of number of iterations based on vector size
  * Add a new benchmark to report effective reduction bandwidth
 
+Requirements:
+ * gcc with std=c11 and OpenMP support
+ * 3 GB+ memory (by default vectors of 1 GB is used)
+
 ## Benchmarks
 Supports the standard Stream benchmarks. To calculate the memory bandwidth, the raw bandwidth is multiplied by the number of vectors (2 or 3) except for the new reduce benchmark. By default FP64 datatype (`double`) is used.
 
