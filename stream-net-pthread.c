@@ -285,7 +285,6 @@ double stream_root_thread(void *arg) {
     int iters = stream_net->iters;
     int j;
     size_t count = stream_net->count / stream_net->threads;
-    //printf ("thread [%d], stream_net->count = %d, count = %d, offset = %d\n", thread_ctx->idx, stream_net->count, count, 0);
 
     double t_get_start = 0.0, t_get_end = 0.0;
     stream_net->t_get_end = 0.0;
@@ -326,7 +325,7 @@ double stream_root_thread(void *arg) {
     double t_end = gettimeus();
     free(tmp_get);
     free(tmp_acc);
-    return t_end - t_start;// - t_get_end;
+    return t_end - t_start - t_get_end;
 }
 
 void *stream_peer_thread(void *arg) {

@@ -20,6 +20,9 @@ DTYPE scalar = 1.234;
 #define WAIT    0
 #define RUN     1
 
+#define min(a,b) ((a) < (b) ? (a) : (b))
+
+#define _256KB 262144
 typedef struct thread_ctx_t thread_ctx_t;
 
 /* Define Stream Benchmarks */
@@ -28,6 +31,26 @@ typedef void (*stream_fn)(DTYPE *, DTYPE *, DTYPE *, size_t, thread_ctx_t *);
 typedef struct thread_sync_t {
     volatile uint64_t v[16]; //128 bytes
 } thread_sync_t;
+
+typedef struct pipe_buff_s {
+    ucs_status_ptr_t ucp_req;
+    size_t count;
+    size_t offset;
+} pipe_buff_t;
+
+typedef struct pipe_s {
+    pipe_buff_t *buffs;
+    size_t num_buffs;
+    size_t buff_sz_count;
+    size_t buff_sz_bytes;
+    size_t count_rem;
+    size_t r_idx;
+    size_t g_idx;
+    size_t g_offset;
+    size_t g_byte_offset;
+    size_t g_count_rem;
+    size_t buffs_avail;
+} pipe_t;
 
 typedef struct stream_mem_rkey_t
 {
@@ -80,6 +103,7 @@ typedef struct thread_ctx_t {
     int idx;
     pthread_t id;
     stream_ucx_t *stream_net;
+    pipe_t pipe;
 } thread_ctx_t;
 
 /* Utility Functions */
@@ -266,62 +290,129 @@ static void thread_set_affinity(thread_ctx_t *ctx)
     pthread_setaffinity_np(thread, sizeof(cpuset), &cpuset); 
 }
 
+void rdma_read(thread_ctx_t *thread_ctx) {
+    ucp_request_param_t req_param = {};
+    pipe_t *pipe = &thread_ctx->pipe;
+    stream_ucx_t *stream_net = thread_ctx->stream_net;
+    size_t g_idx = pipe->g_idx;
+
+    DTYPE *b = NULL;
+
+    if (pipe->buffs_avail && pipe->g_count_rem) {
+        b = stream_net->buffer_b.base;
+        size_t count = min(pipe->buff_sz_count, pipe->g_count_rem);
+        size_t bytes = count * sizeof(DTYPE);
+        size_t offset = pipe->g_offset;
+        size_t byte_offset = pipe->g_byte_offset;
+        pipe->buffs[g_idx].ucp_req = 
+            ucp_get_nbx(stream_net->remote_ep[thread_ctx->idx], &b[offset], bytes,
+                        (uint64_t)(stream_net->buffer_b.rem_base + byte_offset),
+                        stream_net->buffer_b.rem_rkey[thread_ctx->idx], &req_param);
+
+        pipe->buffs[g_idx].count = count;
+        pipe->buffs[g_idx].offset = offset;
+        pipe->g_offset += count;
+        pipe->g_byte_offset += bytes;
+        pipe->g_count_rem -= count;
+        pipe->g_idx = (++pipe->g_idx) % pipe->num_buffs;
+        pipe->buffs_avail--;
+    }
+}
+
+void compute_kernel(thread_ctx_t *thread_ctx)
+{
+    stream_ucx_t *stream_net = thread_ctx->stream_net;
+    pipe_t *pipe = &thread_ctx->pipe;
+    size_t r_idx = pipe->r_idx;
+    ucs_status_ptr_t req = pipe->buffs[r_idx].ucp_req;
+
+    DTYPE   *a = stream_net->buffer_a.base,
+            *b = stream_net->buffer_b.base;
+
+    if (req != NULL && UCS_INPROGRESS != ucp_request_check_status(req)) {
+        ucp_request_free(req);
+        pipe->buffs[r_idx].ucp_req = NULL;
+        size_t offset = pipe->buffs[r_idx].offset;
+        size_t count = pipe->buffs[r_idx].count;
+
+        (stream_net->fn)(&a[offset], &b[offset], NULL, count, thread_ctx);
+
+        pipe->r_idx = (++pipe->r_idx) % pipe->num_buffs;
+        pipe->count_rem-=count;
+        pipe->buffs_avail++;
+    }
+
+    return;
+}
+
+
 double stream_root_thread(void *arg) {
     ucs_status_t status;
-    ucs_status_ptr_t ucp_req[64];
+    ucs_status_ptr_t ucp_req = UCS_OK;
     ucp_request_param_t req_param = {};
 
     thread_ctx_t *thread_ctx = (thread_ctx_t *)arg;
     stream_ucx_t *stream_net = thread_ctx->stream_net;
     thread_sync_t *thread_sync = stream_net->thread_sync;
 
-    thread_set_affinity(thread_ctx);
+    size_t count = stream_net->count / stream_net->threads;
+    size_t offset = thread_ctx->idx * count;
+    size_t bytes = count * sizeof(DTYPE);
+    // if (bytes > 1048576) {
+    //     printf ("%u\n", bytes);
+    //     sleep(20);
+    // }
+    double  t_start = 0.0,  t_get_start = 0.0,
+            t_end = 0.0,    t_get_end = 0.0;
+    int tidx = thread_ctx->idx;
+    stream_net->t_get_end = 0.0;
 
     DTYPE   *a = stream_net->buffer_a.base,
             *b = stream_net->buffer_b.base,
             *c = stream_net->buffer_c.base;
 
-    int tidx = thread_ctx->idx;
-    int iters = stream_net->iters;
-    int j;
-    size_t count = stream_net->count / stream_net->threads;
-    // printf ("thread [%d], stream_net->count = %d, count = %d, offset = %d\n",
-    //     thread_ctx->idx, stream_net->count, count, 0);
-    uint64_t bytes = count * sizeof(DTYPE);
-    // uint64_t bytes_offset = count_offset * sizeof(DTYPE);
-    double t_get_start = 0.0, t_get_end = 0.0;
-    double t_start = 0.0, t_end = 0.0;
-    stream_net->t_get_end = 0.0;
+    thread_set_affinity(thread_ctx);
 
     /* warm up */
-    for (j = 0; j < 10; j++) {
+    for (int i = 0; i < 10; i++) {
         release_peer_threads(thread_sync, stream_net->threads);
+        ucp_req = ucp_get_nbx(stream_net->remote_ep[tidx], &b[offset],
+                    bytes, (uint64_t)stream_net->buffer_b.rem_base,
+                    stream_net->buffer_b.rem_rkey[tidx], &req_param);
+        status = ucx_request_wait(stream_net->ucp_worker[tidx], ucp_req);
         wait_for_peer_threads(thread_sync, stream_net->threads);
     }
 
     t_start = gettimeus();
-    for (j = 0; j < iters; j++)
+    for (int i = 0; i < stream_net->iters; i++)
     {
+        /* reset/init counters */
+        thread_ctx->pipe.buffs_avail = thread_ctx->pipe.num_buffs;
+        thread_ctx->pipe.count_rem = count;
+        thread_ctx->pipe.r_idx = 0;
+        thread_ctx->pipe.g_count_rem = count;
+        thread_ctx->pipe.g_idx = 0;
+        thread_ctx->pipe.g_offset = thread_ctx->idx * count;
+        thread_ctx->pipe.g_byte_offset = thread_ctx->pipe.g_offset * sizeof(DTYPE);
+        memset((void *)thread_ctx->pipe.buffs, 0, thread_ctx->pipe.num_buffs * sizeof(pipe_buff_t));
+
         release_peer_threads(thread_sync, stream_net->threads);
-        size_t bytes_reduced = 0;
-
-        while (bytes_reduced < bytes) {
+        while(thread_ctx->pipe.count_rem > 0) {
             
+            /* try to get buffer */
+            rdma_read(thread_ctx);
+
+            /* try to reduce buffer */
+            compute_kernel(thread_ctx);
+
+            /* progress */
+            while(ucp_worker_progress(stream_net->ucp_worker[tidx])) { }
         }
-        t_get_start = gettimeus();
-        ucp_req = ucp_get_nbx(stream_net->remote_ep[tidx], b, bytes,
-                        (uint64_t)stream_net->buffer_b.rem_base,
-                        stream_net->buffer_b.rem_rkey[tidx], &req_param);
-        status = ucx_request_wait(stream_net->ucp_worker[tidx], ucp_req);
-        t_get_end += gettimeus() - t_get_start;        
-
-        (stream_net->fn)(a, b, c, count, thread_ctx);
-
         wait_for_peer_threads(thread_sync, stream_net->threads);
     }
     t_end = gettimeus();
 
-    return t_end - t_start - t_get_end;
+    return t_end - t_start;
 }
 
 void *stream_peer_thread(void *arg) {
@@ -333,46 +424,65 @@ void *stream_peer_thread(void *arg) {
     stream_ucx_t *stream_net = thread_ctx->stream_net;
     thread_sync_t *sync = stream_net->thread_sync;
 
+    size_t count = stream_net->count / stream_net->threads;
+    size_t offset = thread_ctx->idx * count;
+    uint64_t bytes = count * sizeof(DTYPE);
+    uint64_t byte_offset = count * sizeof(DTYPE);
     int tidx = thread_ctx->idx;
     int iters = stream_net->iters;
-    size_t count = stream_net->count / stream_net->threads;
-    //size_t count_offset = stream_net->maxcount / stream_net->threads; // ->idx * count;
-    size_t count_offset = thread_ctx->idx * count;
-    // printf ("thread [%d], count = %d at offset%d\n", thread_ctx->idx, count, count_offset);
-    uint64_t bytes = count * sizeof(DTYPE);
-    uint64_t byte_offset = count_offset * sizeof(DTYPE);
-
-    thread_set_affinity(thread_ctx);
 
     DTYPE   *a = stream_net->buffer_a.base,
             *b = stream_net->buffer_b.base,
             *c = stream_net->buffer_c.base;
+
+    // printf ("%s sleeping\n", __FUNCTION__);
+    // sleep(20);
+
+    thread_set_affinity(thread_ctx);
 
     /* warm up*/
     for (int j = 0; j < 10; j++) {
         while (stream_net->thread_sync[thread_ctx->idx].v[PEER] == WAIT) {
         }
         stream_net->thread_sync[thread_ctx->idx].v[PEER] = WAIT;
+        ucp_req = ucp_get_nbx(stream_net->remote_ep[tidx], &b[offset], bytes,
+                        (uint64_t)(stream_net->buffer_b.rem_base + byte_offset),
+                        stream_net->buffer_b.rem_rkey[tidx], &req_param);
+        status = ucx_request_wait(stream_net->ucp_worker[tidx], ucp_req);
         stream_net->thread_sync[thread_ctx->idx].v[ROOT] = WAIT;
     }
 
-    // compute
+    // run all iterations
     for (int j = 0; j < iters; j++)
     {
+        /* reset/init counters */
+        thread_ctx->pipe.buffs_avail = thread_ctx->pipe.num_buffs;
+        thread_ctx->pipe.count_rem = count;
+        thread_ctx->pipe.r_idx = 0;
+        thread_ctx->pipe.g_count_rem = count;
+        thread_ctx->pipe.g_idx = 0;
+        thread_ctx->pipe.g_offset = thread_ctx->idx * count;
+        thread_ctx->pipe.g_byte_offset = thread_ctx->pipe.g_offset * sizeof(DTYPE);
+        memset((void *)thread_ctx->pipe.buffs, 0, thread_ctx->pipe.num_buffs * sizeof(pipe_buff_t));
+
         /*wait for root thread*/
-        while (stream_net->thread_sync[thread_ctx->idx].v[PEER] == WAIT) {
+        while (stream_net->thread_sync[tidx].v[PEER] == WAIT) {
         }
-        stream_net->thread_sync[thread_ctx->idx].v[PEER] = WAIT;
+        stream_net->thread_sync[tidx].v[PEER] = WAIT;
 
-        ucp_req = ucp_get_nbx(stream_net->remote_ep[tidx], &b[count_offset], bytes,
-                        (uint64_t)(stream_net->buffer_b.rem_base + byte_offset),
-                        stream_net->buffer_b.rem_rkey[tidx], &req_param);
-        status = ucx_request_wait(stream_net->ucp_worker[tidx/2], ucp_req);
+        while (thread_ctx->pipe.count_rem > 0) {
+            /* try to get buffer */
+            rdma_read(thread_ctx);
 
-        (stream_net->fn)(&a[count_offset], &b[count_offset], &c[count_offset],
-             count, thread_ctx);
+            /* try to reduce buffer */
+            compute_kernel(thread_ctx);
 
-        stream_net->thread_sync[thread_ctx->idx].v[ROOT] = WAIT;
+            /* progress */
+            while(ucp_worker_progress(stream_net->ucp_worker[tidx])) { }
+        }
+
+        /* Signal root */
+        stream_net->thread_sync[tidx].v[ROOT] = WAIT;
     }
 }
 
@@ -401,7 +511,6 @@ double run_bench(stream_fn fn, DTYPE *a, DTYPE *b, DTYPE *c, size_t count, int i
 
     double lat_us = 0.0;
     if (fn == stream_reduce_get) {
-
         for (int i = 1; i < stream_net->threads; i++) {
             pthread_create(&thread_ctx[i].id, NULL, stream_peer_thread, &thread_ctx[i]);
         }
@@ -470,7 +579,7 @@ static int stream_ucx_init(stream_ucx_t *stream_net)
         goto err;
     }
 
-    for (int i = 0; i < stream_net->threads; i++) {
+    for (int i = 0; i < stream_net->threads; i+=2) {
         memset(&worker_params, 0, sizeof(worker_params));
         worker_params.field_mask = UCP_WORKER_PARAM_FIELD_THREAD_MODE;
         worker_params.thread_mode = UCS_THREAD_MODE_MULTI;
@@ -492,11 +601,15 @@ static int stream_ucx_init(stream_ucx_t *stream_net)
             ret = UCS_ERR_NO_MESSAGE;
             goto err_worker;
         }
+
+        /* copy worker, 2threads/worker */
+        stream_net->ucp_worker[i+1]  = stream_net->ucp_worker[i];
+        stream_net->worker_attr[i+1] = stream_net->worker_attr[i];
     }
 
     return ret;
 err_worker:
-    for (int i = 0; i < stream_net->threads; i++) {
+    for (int i = 0; i < stream_net->threads; i+=2) {
         ucp_worker_destroy(stream_net->ucp_worker[i]);
     }
 err_cleanup:
@@ -534,7 +647,7 @@ static int stream_connect_workers(stream_ucx_t *stream_net)
     ep_params.address = stream_net->rem_worker_addr;
 
     for (int i = 0; i < stream_net->threads; i++) {
-        status = ucp_ep_create(stream_net->ucp_worker[i/2], &ep_params, &stream_net->remote_ep[i]);
+        status = ucp_ep_create(stream_net->ucp_worker[i], &ep_params, &stream_net->remote_ep[i]);
         if (status != UCS_OK) {
             fprintf(stderr, "!!! failed to create endpoint to remote %d (%s)\n",
                     status, ucs_status_string(status));
@@ -648,7 +761,7 @@ static void stream_register_buffer(stream_ucx_t *stream_net, DTYPE *buffer,
 
 static int stream_ucx_fini(stream_ucx_t *stream_net)
 {
-    for (int i = 0; i < stream_net->threads; i++) {
+    for (int i = 0; i < stream_net->threads; i+=2) {
         ucp_worker_release_address(stream_net->ucp_worker[i], stream_net->worker_attr[i].address);
         ucp_worker_destroy(stream_net->ucp_worker[i]);
     }
@@ -679,9 +792,19 @@ int main(int argc, char **argv)
     stream_net->buffer_c.rem_rkey = calloc(stream_net->threads, sizeof(ucp_rkey_h));
 
     thread_ctx_t *thread_ctx = calloc(stream_net->threads, sizeof(thread_ctx_t));
+    env = getenv("STREAM_NUM_BUFFS");
+    size_t stream_num_buffs = (env == NULL) ? 2 : atoi(env);
+
+    env = getenv("STREAM_BUFF_SIZE");
+    size_t stream_buff_size = (env == NULL) ? _256KB : atoi(env);
+
     for (int i = 0; i < stream_net->threads; i++) {
         thread_ctx[i].stream_net = stream_net;
         thread_ctx[i].idx = i;
+        thread_ctx[i].pipe.num_buffs = stream_num_buffs;
+        thread_ctx[i].pipe.buff_sz_count = stream_buff_size / sizeof(DTYPE);
+        thread_ctx[i].pipe.buff_sz_bytes = stream_buff_size;
+        thread_ctx[i].pipe.buffs = calloc(stream_num_buffs, sizeof(pipe_buff_t));
     }
 
     // sleep(20);

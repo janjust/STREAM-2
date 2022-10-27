@@ -310,7 +310,7 @@ double stream_root_thread(void *arg) {
     {
         release_peer_threads(thread_sync, stream_net->threads);
         /* Get the data */
-        #if 1
+        #if 0
         t_get_start = gettimeus();
         ucp_req = ucp_get_nbx(stream_net->remote_ep[tidx], b, bytes,
                         (uint64_t)stream_net->buffer_b.rem_base,
@@ -329,7 +329,7 @@ double stream_root_thread(void *arg) {
     free(tmp_get);
     free(tmp_acc);
 
-    return t_end - t_start;// - t_get_end;
+    return t_end - t_start - t_get_end;
 }
 
 void *stream_peer_thread(void *arg) {
@@ -344,9 +344,7 @@ void *stream_peer_thread(void *arg) {
     int tidx = thread_ctx->idx;
     int iters = stream_net->iters;
     size_t count = stream_net->count / stream_net->threads;
-    //size_t count_offset = stream_net->maxcount / stream_net->threads; // ->idx * count;
     size_t count_offset = thread_ctx->idx * count;
-    // printf ("thread [%d], count = %d at offset%d\n", thread_ctx->idx, count, count_offset);
     uint64_t bytes = count * sizeof(DTYPE);
     uint64_t byte_offset = count_offset * sizeof(DTYPE);
 
@@ -379,11 +377,13 @@ void *stream_peer_thread(void *arg) {
         }
         stream_net->thread_sync[thread_ctx->idx].v[PEER] = WAIT;
 
-        // ucp_req = ucp_get_nbx(stream_net->remote_ep[tidx], &b[count_offset], bytes,
-        ucp_req = ucp_get_nbx(stream_net->remote_ep[tidx], b, bytes,
+        #if 0
+        ucp_req = ucp_get_nbx(stream_net->remote_ep[tidx], &b[count_offset], bytes,
+        //ucp_req = ucp_get_nbx(stream_net->remote_ep[tidx], b, bytes,
                         (uint64_t)(stream_net->buffer_b.rem_base + byte_offset),
                         stream_net->buffer_b.rem_rkey[tidx], &req_param);
         status = ucx_request_wait(stream_net->ucp_worker[tidx], ucp_req);
+        #endif
 
         (stream_net->fn)(&a[count_offset], &b[count_offset], &c[count_offset],
              count, thread_ctx);
