@@ -95,7 +95,6 @@ typedef struct _stream_ucx_t
     size_t maxbytes;
     int iters;
     size_t count;
-    double t_get_end;
     char rem_rkey_buf[MAX_RKEY_LEN];
 } stream_ucx_t;
 
@@ -104,6 +103,7 @@ typedef struct thread_ctx_t {
     pthread_t id;
     stream_ucx_t *stream_net;
     pipe_t pipe;
+    double t_reduce;
 } thread_ctx_t;
 
 /* Utility Functions */
@@ -294,34 +294,29 @@ void rdma_read(thread_ctx_t *thread_ctx) {
     ucp_request_param_t req_param = {};
     pipe_t *pipe = &thread_ctx->pipe;
     stream_ucx_t *stream_net = thread_ctx->stream_net;
-    size_t g_idx = 0; //pipe->g_idx;
+    size_t g_idx = 0;
 
     DTYPE *b = NULL;
     b = stream_net->buffer_b.base;
 
-    for (int i = 0; i < 4; i++) {
-        if (pipe->buffs_avail && pipe->g_count_rem) {
-            g_idx = pipe->g_idx;
-            size_t count = min(pipe->buff_sz_count, pipe->g_count_rem);
-            size_t bytes = count * sizeof(DTYPE);
-            size_t offset = pipe->g_offset;
-            size_t byte_offset = pipe->g_byte_offset;
-            pipe->buffs[g_idx].ucp_req = 
-                ucp_get_nbx(stream_net->remote_ep[thread_ctx->idx], &b[offset], bytes,
-                            (uint64_t)(stream_net->buffer_b.rem_base + byte_offset),
-                            stream_net->buffer_b.rem_rkey[thread_ctx->idx], &req_param);
+    if (pipe->buffs_avail && pipe->g_count_rem) {
+        g_idx = (pipe->g_idx % pipe->num_buffs);
+        size_t count = min(pipe->buff_sz_count, pipe->g_count_rem);
+        size_t bytes = count * sizeof(DTYPE);
+        size_t offset = pipe->g_offset;
+        size_t byte_offset = pipe->g_byte_offset;
+        pipe->buffs[g_idx].ucp_req =
+            ucp_get_nbx(stream_net->remote_ep[thread_ctx->idx], &b[offset], bytes,
+                        (uint64_t)(stream_net->buffer_b.rem_base + byte_offset),
+                        stream_net->buffer_b.rem_rkey[thread_ctx->idx], &req_param);
 
-            pipe->buffs[g_idx].count = count;
-            pipe->buffs[g_idx].offset = offset;
-            pipe->g_offset += count;
-            pipe->g_byte_offset += bytes;
-            pipe->g_count_rem -= count;
-            pipe->g_idx = (++pipe->g_idx) % pipe->num_buffs;
-            pipe->buffs_avail--;
-        }
-        else {
-            break;
-        }
+        pipe->buffs[g_idx].count = count;
+        pipe->buffs[g_idx].offset = offset;
+        pipe->g_offset += count;
+        pipe->g_byte_offset += bytes;
+        pipe->g_count_rem -= count;
+        pipe->g_idx++;
+        pipe->buffs_avail--;
     }
 }
 
@@ -329,30 +324,39 @@ void compute_kernel(thread_ctx_t *thread_ctx)
 {
     stream_ucx_t *stream_net = thread_ctx->stream_net;
     pipe_t *pipe = &thread_ctx->pipe;
-    size_t r_idx = pipe->r_idx;
+    size_t r_idx = pipe->r_idx % pipe->num_buffs;
     ucs_status_ptr_t req = pipe->buffs[r_idx].ucp_req;
+    double t1 = 0.0;
 
     DTYPE   *a = stream_net->buffer_a.base,
-            *b = stream_net->buffer_b.base;
+            *b = stream_net->buffer_b.base,
+            *c = stream_net->buffer_c.base;
 
-    if (req != NULL && UCS_INPROGRESS != ucp_request_check_status(req)) {
+    if ((pipe->r_idx <= pipe->g_idx)
+        && req != NULL && UCS_INPROGRESS != ucp_request_check_status(req)) {
+        t1 = gettimeus();
+
         ucp_request_free(req);
         pipe->buffs[r_idx].ucp_req = NULL;
+        
         size_t offset = pipe->buffs[r_idx].offset;
         size_t count = pipe->buffs[r_idx].count;
 
         (stream_net->fn)(&a[offset], &b[offset], NULL, count, thread_ctx);
 
-        pipe->r_idx = (++pipe->r_idx) % pipe->num_buffs;
+        pipe->r_idx++;
         pipe->count_rem-=count;
         pipe->buffs_avail++;
+
+        thread_ctx->t_reduce += gettimeus() - t1;
     }
 
     return;
 }
 
 
-double stream_root_thread(void *arg) {
+double stream_root_thread(void *arg)
+{
     ucs_status_t status;
     ucs_status_ptr_t ucp_req = UCS_OK;
     ucp_request_param_t req_param = {};
@@ -364,14 +368,11 @@ double stream_root_thread(void *arg) {
     size_t count = stream_net->count / stream_net->threads;
     size_t offset = thread_ctx->idx * count;
     size_t bytes = count * sizeof(DTYPE);
-    // if (bytes > 1048576) {
-    //     printf ("%u\n", bytes);
-    //     sleep(20);
-    // }
-    double  t_start = 0.0,  t_get_start = 0.0,
-            t_end = 0.0,    t_get_end = 0.0;
+    size_t byte_offset = thread_ctx->idx * bytes;
+
+    double  t_start = 0.0, t_end = 0.0;
     int tidx = thread_ctx->idx;
-    stream_net->t_get_end = 0.0;
+    thread_ctx->t_reduce = 0.0;
 
     DTYPE   *a = stream_net->buffer_a.base,
             *b = stream_net->buffer_b.base,
@@ -393,14 +394,14 @@ double stream_root_thread(void *arg) {
     for (int i = 0; i < stream_net->iters; i++)
     {
         /* reset/init counters */
-        thread_ctx->pipe.buffs_avail = thread_ctx->pipe.num_buffs;
-        thread_ctx->pipe.count_rem = count;
-        thread_ctx->pipe.r_idx = 0;
-        thread_ctx->pipe.g_count_rem = count;
-        thread_ctx->pipe.g_idx = 0;
-        thread_ctx->pipe.g_offset = thread_ctx->idx * count;
-        thread_ctx->pipe.g_byte_offset = thread_ctx->pipe.g_offset * sizeof(DTYPE);
         memset((void *)thread_ctx->pipe.buffs, 0, thread_ctx->pipe.num_buffs * sizeof(pipe_buff_t));
+        thread_ctx->pipe.count_rem = count;
+        thread_ctx->pipe.r_idx = 0; 
+        thread_ctx->pipe.g_idx = 0;
+        thread_ctx->pipe.g_offset = offset;
+        thread_ctx->pipe.g_byte_offset = byte_offset;
+        thread_ctx->pipe.g_count_rem = count;
+        thread_ctx->pipe.buffs_avail = thread_ctx->pipe.num_buffs;
 
         release_peer_threads(thread_sync, stream_net->threads);
         while(thread_ctx->pipe.count_rem > 0) {
@@ -432,17 +433,14 @@ void *stream_peer_thread(void *arg) {
 
     size_t count = stream_net->count / stream_net->threads;
     size_t offset = thread_ctx->idx * count;
-    uint64_t bytes = count * sizeof(DTYPE);
-    uint64_t byte_offset = count * sizeof(DTYPE);
+    size_t bytes = count * sizeof(DTYPE);
+    size_t byte_offset = thread_ctx->idx * bytes;
     int tidx = thread_ctx->idx;
     int iters = stream_net->iters;
 
     DTYPE   *a = stream_net->buffer_a.base,
             *b = stream_net->buffer_b.base,
             *c = stream_net->buffer_c.base;
-
-    // printf ("%s sleeping\n", __FUNCTION__);
-    // sleep(20);
 
     thread_set_affinity(thread_ctx);
 
@@ -462,14 +460,14 @@ void *stream_peer_thread(void *arg) {
     for (int j = 0; j < iters; j++)
     {
         /* reset/init counters */
-        thread_ctx->pipe.buffs_avail = thread_ctx->pipe.num_buffs;
+        memset((void *)thread_ctx->pipe.buffs, 0, thread_ctx->pipe.num_buffs * sizeof(pipe_buff_t));
         thread_ctx->pipe.count_rem = count;
         thread_ctx->pipe.r_idx = 0;
-        thread_ctx->pipe.g_count_rem = count;
         thread_ctx->pipe.g_idx = 0;
-        thread_ctx->pipe.g_offset = thread_ctx->idx * count;
-        thread_ctx->pipe.g_byte_offset = thread_ctx->pipe.g_offset * sizeof(DTYPE);
-        memset((void *)thread_ctx->pipe.buffs, 0, thread_ctx->pipe.num_buffs * sizeof(pipe_buff_t));
+        thread_ctx->pipe.g_offset = offset;
+        thread_ctx->pipe.g_byte_offset = byte_offset;
+        thread_ctx->pipe.g_count_rem = count;
+        thread_ctx->pipe.buffs_avail = thread_ctx->pipe.num_buffs;
 
         /*wait for root thread*/
         while (stream_net->thread_sync[tidx].v[PEER] == WAIT) {
@@ -496,19 +494,14 @@ void *stream_peer_thread(void *arg) {
 double run_bench(stream_fn fn, DTYPE *a, DTYPE *b, DTYPE *c, size_t count, int iters,
     thread_ctx_t *thread_ctx)
 {
-    double t_end = 0.0, t_start = 0.0;
     stream_ucx_t *stream_net = thread_ctx->stream_net;
     stream_net->count = count;
     stream_net->iters = iters;
     stream_net->fn = fn;
 
-    // printf ("count = %d\n", count);
-
     if (stream_net->rank > 0) {
         return 0.0;
     }
-
-    // sleep(20);
     
     double lat_us = 0.0;
     if (fn == stream_reduce_get) {
@@ -516,24 +509,22 @@ double run_bench(stream_fn fn, DTYPE *a, DTYPE *b, DTYPE *c, size_t count, int i
             pthread_create(&thread_ctx[i].id, NULL, stream_peer_thread, &thread_ctx[i]);
         }
 
-        // t_start = gettimeus();
         lat_us = stream_root_thread((void *)&thread_ctx[0]);
-        // t_end = gettimeus();// - stream_net->t_get_end;
 
         for (size_t i = 1; i < stream_net->threads; i++) {
             pthread_join(thread_ctx[i].id, NULL);
         }
     }
     else {
-        // t_start = gettimeus();
+        double t1 = gettimeus();
         for (int j = 0; j < iters; j++)
         {
             (fn)(a, b, c, count, thread_ctx);
         }
-        // t_end = gettimeus();
+        lat_us = gettimeus() - t1;
     }
 
-    // double lat_us = (t_end - t_start) / iters;
+    thread_ctx[0].t_reduce = thread_ctx[0].t_reduce / iters;
     return lat_us / iters;
 }
 
@@ -548,7 +539,8 @@ void print_header()
     int num_bench = sizeof(benchmarks) / sizeof(benchmarks[0]);
     for (int i = num_bench-1; i < num_bench; i++)
     {
-        printf("%11s", benchmarks[i].name);
+        printf("%11s %11s %11s", benchmarks[i].name, "get-reduce-lat(usec)", "reduce-iso-lat(usec)");
+            // "get-reduce(usec)", "get(usec)", "reduce(usec)", "reduce_bw(GB/s)");
     }
     printf("\n");
 }
@@ -877,7 +869,8 @@ int main(int argc, char **argv)
             double bw_GBs = 1e-3 * nbytes / lat_us;
             bw_GBs *= bench.num_vectors;
             if (stream_net->rank == 0)
-                printf("%11.2lf", bw_GBs);
+                printf("%11.2lf %11.2lf %11.2lf", bw_GBs, lat_us, thread_ctx[0].t_reduce);
+                // printf("%11.2lf %11.2lf %11.2lf %11.2lf %11.2lf", bw_GBs, lat_us, (lat_us - thread_ctx[0].t_reduce), thread_ctx[0].t_reduce, 1e-3 * nbytes / thread_ctx[0].t_reduce);
         }
         if (stream_net->rank == 0)
             printf("\n");
