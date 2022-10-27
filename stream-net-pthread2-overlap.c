@@ -294,28 +294,34 @@ void rdma_read(thread_ctx_t *thread_ctx) {
     ucp_request_param_t req_param = {};
     pipe_t *pipe = &thread_ctx->pipe;
     stream_ucx_t *stream_net = thread_ctx->stream_net;
-    size_t g_idx = pipe->g_idx;
+    size_t g_idx = 0; //pipe->g_idx;
 
     DTYPE *b = NULL;
+    b = stream_net->buffer_b.base;
 
-    if (pipe->buffs_avail && pipe->g_count_rem) {
-        b = stream_net->buffer_b.base;
-        size_t count = min(pipe->buff_sz_count, pipe->g_count_rem);
-        size_t bytes = count * sizeof(DTYPE);
-        size_t offset = pipe->g_offset;
-        size_t byte_offset = pipe->g_byte_offset;
-        pipe->buffs[g_idx].ucp_req = 
-            ucp_get_nbx(stream_net->remote_ep[thread_ctx->idx], &b[offset], bytes,
-                        (uint64_t)(stream_net->buffer_b.rem_base + byte_offset),
-                        stream_net->buffer_b.rem_rkey[thread_ctx->idx], &req_param);
+    for (int i = 0; i < 4; i++) {
+        if (pipe->buffs_avail && pipe->g_count_rem) {
+            g_idx = pipe->g_idx;
+            size_t count = min(pipe->buff_sz_count, pipe->g_count_rem);
+            size_t bytes = count * sizeof(DTYPE);
+            size_t offset = pipe->g_offset;
+            size_t byte_offset = pipe->g_byte_offset;
+            pipe->buffs[g_idx].ucp_req = 
+                ucp_get_nbx(stream_net->remote_ep[thread_ctx->idx], &b[offset], bytes,
+                            (uint64_t)(stream_net->buffer_b.rem_base + byte_offset),
+                            stream_net->buffer_b.rem_rkey[thread_ctx->idx], &req_param);
 
-        pipe->buffs[g_idx].count = count;
-        pipe->buffs[g_idx].offset = offset;
-        pipe->g_offset += count;
-        pipe->g_byte_offset += bytes;
-        pipe->g_count_rem -= count;
-        pipe->g_idx = (++pipe->g_idx) % pipe->num_buffs;
-        pipe->buffs_avail--;
+            pipe->buffs[g_idx].count = count;
+            pipe->buffs[g_idx].offset = offset;
+            pipe->g_offset += count;
+            pipe->g_byte_offset += bytes;
+            pipe->g_count_rem -= count;
+            pipe->g_idx = (++pipe->g_idx) % pipe->num_buffs;
+            pipe->buffs_avail--;
+        }
+        else {
+            break;
+        }
     }
 }
 
@@ -504,11 +510,6 @@ double run_bench(stream_fn fn, DTYPE *a, DTYPE *b, DTYPE *c, size_t count, int i
 
     // sleep(20);
     
-    /* Ignore first iteration */
-    if (thread_ctx->idx == 0) {
-        (fn)(a, b, c, count, thread_ctx);
-    }
-
     double lat_us = 0.0;
     if (fn == stream_reduce_get) {
         for (int i = 1; i < stream_net->threads; i++) {
@@ -819,7 +820,7 @@ int main(int argc, char **argv)
 
     size_t pg_size = sysconf(_SC_PAGESIZE);
     stream_net->mincount = (1 << 12) / sizeof(DTYPE);
-    stream_net->maxcount = (1 << 22) / sizeof(DTYPE);
+    stream_net->maxcount = (1 << 24) / sizeof(DTYPE);
     stream_net->maxbytes = stream_net->maxcount * sizeof(DTYPE);
 
     DTYPE *a = aligned_alloc(pg_size, stream_net->maxbytes);

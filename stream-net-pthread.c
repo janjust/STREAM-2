@@ -325,7 +325,7 @@ double stream_root_thread(void *arg) {
     double t_end = gettimeus();
     free(tmp_get);
     free(tmp_acc);
-    return t_end - t_start - t_get_end;
+    return t_end - t_start;// - t_get_end;
 }
 
 void *stream_peer_thread(void *arg) {
