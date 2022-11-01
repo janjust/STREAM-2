@@ -341,9 +341,9 @@ void compute_kernel(thread_ctx_t *thread_ctx)
         
         count = pipe->buffs[r_idx].count;
 
-        // (stream_net->fn)(pipe->buffs[r_idx].accbuf,
-        //                 pipe->buffs[r_idx].getbuf,
-        //                 NULL, count, thread_ctx);
+        (stream_net->fn)(pipe->buffs[r_idx].accbuf,
+                        pipe->buffs[r_idx].getbuf,
+                        NULL, count, thread_ctx);
 
         pipe->r_idx++;
         pipe->count_rem-=count;
