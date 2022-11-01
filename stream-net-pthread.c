@@ -672,8 +672,10 @@ int main(int argc, char **argv)
     MPI_Comm_size(MPI_COMM_WORLD, &stream_net->size);
 
     rank = stream_net->rank;
+	char hostname[1024];
+	gethostname(hostname, 1024);
 
-    printf(" Rank %d/%d, pid=%d\n", stream_net->rank, stream_net->size, getpid());
+    printf(" Rank %d/%d, pid=%d, %s\n", stream_net->rank, stream_net->size, getpid(), hostname);
 
     size_t pg_size = sysconf(_SC_PAGESIZE);
     stream_net->mincount = (1 << 12) / sizeof(DTYPE);
