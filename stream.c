@@ -137,7 +137,7 @@ int main(int argc, char **argv)
 {
     size_t pg_size  = sysconf(_SC_PAGESIZE);
     size_t mincount = (1<<12)  / sizeof(DTYPE);
-    size_t maxcount = (1<<30)  / sizeof(DTYPE);
+    size_t maxcount = (1<<24)  / sizeof(DTYPE);
     size_t maxbytes = maxcount * sizeof(DTYPE);
 
     DTYPE *a = aligned_alloc(pg_size, maxbytes);

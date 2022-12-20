@@ -1,46 +1,31 @@
 CC=gcc
 MPICC=mpicc
 
-CFLAGS = -I$(UCC_DIR)/include -I$(UCX_DIR)/include -std=c11 -fopenmp
-LDFLAGS = -L$(UCC_DIR)/lib $(UCC_DIR)/lib/libucc.so $(UCX_DIR)/lib/libucs.so $(UCX_DIR)/lib/libucp.so -Wl,-rpath -Wl,$(UCC_DIR)/lib -Wl,-rpath -Wl,$(UCX_DIR)/lib -lpthread
-
+CFLAGS_MPI = -I$(UCC_DIR)/include -I$(UCX_DIR)/include -std=c11 -fopenmp
+LDFLAGS_MPI = -L$(UCC_DIR)/lib $(UCC_DIR)/lib/libucc.so $(UCX_DIR)/lib/libucs.so $(UCX_DIR)/lib/libucp.so -Wl,-rpath -Wl,$(UCC_DIR)/lib -Wl,-rpath -Wl,$(UCX_DIR)/lib -lpthread
 
 #OPTFLAGS=-O2 -Wall -Wpedantic
 #OPTFLAGS=-O3 -march=native -mavx -ffast-math
 OPTFLAGS=-O3 -ftree-vectorize -ffast-math ##-mcpu=cortex-a72
-OPTFLAGS-DBG=-O0 -g 
+#OPTFLAGS=-O0 -g
 
-default:
-	$(CC) $(OPTFLAGS) $(CFLAGS) -DOPTFLAGS='"$(OPTFLAGS)"' -o stream.exe stream.c $(LDFLAGS)
+stream:
+	$(CC) $(OPTFLAGS) -std=c11 -fopenmp -DOPTFLAGS='"$(OPTFLAGS)"' -o stream.exe stream.c
 
-omp:
-	$(MPICC) $(OPTFLAGS) $(CFLAGS) -DOPTFLAGS='"$(OPTFLAGS)"' -o stream-net-omp.exe stream-net-omp.c $(LDFLAGS)
+stream-pt:
+	$(CC) $(OPTFLAGS) -std=c11 -DOPTFLAGS='"$(OPTFLAGS)"' -o stream-pt.exe stream-pt.c -lpthread
 
-pthread:
-	$(MPICC) $(OPTFLAGS) $(CFLAGS) -DOPTFLAGS='"$(OPTFLAGS)"' -o stream-net-pthread.exe stream-net-pthread.c $(LDFLAGS)
+omp-simple:
+	$(MPICC) $(OPTFLAGS) $(CFLAGS_MPI) -DOPTFLAGS='"$(OPTFLAGS)"' -o stream-pt.exe stream-omp.c $(LDFLAGS_MPI)
 
-pthread-dbg:
-	$(MPICC) $(OPTFLAGS-DBG) $(CFLAGS) -DOPTFLAGS='"$(OPTFLAGS)"' -o stream-net-pthread.exe stream-net-pthread.c $(LDFLAGS)
+pt-simple:
+	$(MPICC) $(OPTFLAGS) $(CFLAGS_MPI) -DOPTFLAGS='"$(OPTFLAGS)"' -o stream-pt.exe stream-pt-simple.c $(LDFLAGS_MPI)
 
-pthread-push:
-	$(MPICC) $(OPTFLAGS) $(CFLAGS) -DOPTFLAGS='"$(OPTFLAGS)"' -o stream-net-pthread-push.exe stream-net-pthread-push.c $(LDFLAGS)
+pt-multi:
+	$(MPICC) $(OPTFLAGS) $(CFLAGS_MPI) -DOPTFLAGS='"$(OPTFLAGS)"' -o stream-pt.exe stream-pt-multi.c $(LDFLAGS_MPI)
 
-pthread-push-dbg:
-	$(MPICC) $(OPTFLAGS-DBG) $(CFLAGS) -DOPTFLAGS='"$(OPTFLAGS)"' -o stream-net-pthread-push.exe stream-net-pthread-push.c $(LDFLAGS)
-
-
-pthread2:
-	$(MPICC) $(OPTFLAGS) $(CFLAGS) -DOPTFLAGS='"$(OPTFLAGS)"' -o stream-net-pthread2.exe stream-net-pthread2.c $(LDFLAGS)
-
-pthread2-dbg:
-	$(MPICC) $(OPTFLAGS-DBG) $(CFLAGS) -DOPTFLAGS='"$(OPTFLAGS)"' -o stream-net-pthread2.exe stream-net-pthread2.c $(LDFLAGS)
-
-pthread2-overlap:
-	$(MPICC) $(OPTFLAGS) $(CFLAGS) -DOPTFLAGS='"$(OPTFLAGS)"' -o stream-net-pthread2-overlap.exe stream-net-pthread2-overlap.c $(LDFLAGS)
-
-pthread2-overlap-dbg:
-	$(MPICC) $(OPTFLAGS-DBG) $(CFLAGS) -DOPTFLAGS='"$(OPTFLAGS)"' -o stream-net-pthread2-overlap.exe stream-net-pthread2-overlap.c $(LDFLAGS)
-
+pt-multi-pipe:
+	$(MPICC) $(OPTFLAGS) $(CFLAGS_MPI) -DOPTFLAGS='"$(OPTFLAGS)"' -o stream-pt.exe stream-pt-multi-pipe.c $(LDFLAGS_MPI)
 
 clean:
 	rm -f stream *.exe
