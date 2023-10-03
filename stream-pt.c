@@ -56,7 +56,6 @@ typedef struct thread_ctx_t {
     void *a;
     void *b;
     void *c;
-    void *d;
 } thread_ctx_t;
 
 /* Utility Functions */
@@ -83,23 +82,19 @@ int get_num_iters(size_t nbytes)
         iters = 1e1;
     if (nbytes > 1e9)
         iters = 1e0;
-    return iters * 1000; // * 1000;
+    return iters * 10;
 }
 
 /* Compute Functions Based on STREAM Benchmark */
 void reduce_pthread(DTYPE *restrict a, DTYPE *restrict b, DTYPE *restrict d,
     size_t count, thread_ctx_t *ctx)
 {
-    
+
     volatile DTYPE tmp;
     for (size_t i = 0; i < count; i++) {
         a[i] *= b[i];
     }
 
-    /* Invalidate get data */
-    for (size_t i = 0; i < count; i++) {
-        tmp = d[i];
-    }
 }
 
 typedef struct benchmark
@@ -167,7 +162,7 @@ static void thread_set_affinity(thread_ctx_t *thread_ctx)
     int i=0, j=0;
     CPU_SET(thread_ctx->idx * places, &cpuset);
 
-    pthread_setaffinity_np(thread, sizeof(cpuset), &cpuset); 
+    pthread_setaffinity_np(thread, sizeof(cpuset), &cpuset);
 }
 
 double stream_root_thread(void *arg)
@@ -183,20 +178,19 @@ double stream_root_thread(void *arg)
 
     DTYPE   *ta = thread_ctx->a,
             *tb = thread_ctx->b,
-            *tc = thread_ctx->c,
-            *td = thread_ctx->d;
-    
-    // DTYPE   *sa = stream->a,
-    //         *sb = stream->b,
-    //         *sc = stream->c;
+            *tc = thread_ctx->c;
+
+//     DTYPE   *sa = stream->a,
+//             *sb = stream->b,
+//             *sc = stream->c;
 
     thread_set_affinity(thread_ctx);
 
     /* warm up */
     for (int i = 0; i < 10; i++) {
         release_peer_threads(thread_sync, stream->threads);
-        // (stream->fn)(&sa[offset], &sb[offset], NULL, count, thread_ctx);
-        (stream->fn)(ta, tb, td, count, thread_ctx);
+//         (stream->fn)(&sa[offset], &sb[offset], NULL, count, thread_ctx);
+        (stream->fn)(ta, tb, NULL, count, thread_ctx);
         wait_for_peer_threads(thread_sync, stream->threads);
     }
 
@@ -205,8 +199,8 @@ double stream_root_thread(void *arg)
     {
         release_peer_threads(thread_sync, stream->threads);
 
-        // (stream->fn)(&sa[offset], &sb[offset], NULL, count, thread_ctx);
-        (stream->fn)(ta, tb, td, count, thread_ctx);
+//         (stream->fn)(&sa[offset], &sb[offset], NULL, count, thread_ctx);
+        (stream->fn)(ta, tb, NULL, count, thread_ctx);
         wait_for_peer_threads(thread_sync, stream->threads);
     }
     t_end = gettimeus();
@@ -227,12 +221,11 @@ void *stream_peer_thread(void *arg)
 
     DTYPE   *ta = thread_ctx->a,
             *tb = thread_ctx->b,
-            *tc = thread_ctx->c,
-            *td = thread_ctx->d;
+            *tc = thread_ctx->c;
 
-    // DTYPE   *sa = stream->a,
-    //         *sb = stream->b,
-    //         *sc = stream->c;
+//     DTYPE   *sa = stream->a,
+//             *sb = stream->b,
+//             *sc = stream->c;
 
     thread_set_affinity(thread_ctx);
 
@@ -242,8 +235,8 @@ void *stream_peer_thread(void *arg)
         }
         sync->v[PEER] = WAIT;
 
-        // (stream->fn)(&sa[offset], &sb[offset], NULL, count, thread_ctx);
-        (stream->fn)(ta, tb, td, count, thread_ctx);
+//         (stream->fn)(&sa[offset], &sb[offset], NULL, count, thread_ctx);
+        (stream->fn)(ta, tb, NULL, count, thread_ctx);
 
         sync->v[ROOT] = WAIT;
     }
@@ -256,8 +249,8 @@ void *stream_peer_thread(void *arg)
         }
         sync->v[PEER] = WAIT;
 
-        // (stream->fn)(&sa[offset], &sb[offset], NULL, count, thread_ctx);
-        (stream->fn)(ta, tb, td, count, thread_ctx);
+//         (stream->fn)(&sa[offset], &sb[offset], NULL, count, thread_ctx);
+        (stream->fn)(ta, tb, NULL, count, thread_ctx);
 
         /* Signal root */
         sync->v[ROOT] = WAIT;
@@ -301,12 +294,9 @@ int main(int argc, char **argv)
     thread_ctx = calloc(stream->threads, sizeof(thread_ctx_t));
     size_t pg_size = sysconf(_SC_PAGESIZE);
 
-    stream->mincount = (1 << 20) / sizeof(DTYPE);
-    stream->maxcount = (1 << 20) / sizeof(DTYPE);
+    stream->mincount = (1 << 12) / sizeof(DTYPE);
+    stream->maxcount = (1 << 24) / sizeof(DTYPE);
     stream->maxbytes = stream->maxcount * sizeof(DTYPE);
-
-    // printf ("Done and sleeping\n");
-    // sleep(30);
 
     size_t bytes = stream->maxbytes / stream->threads;
 
@@ -317,20 +307,22 @@ int main(int argc, char **argv)
         thread_ctx[i].idx = i;
         thread_ctx[i].stream = stream;
 
-        thread_ctx[i].a = mmap(NULL, 4 * bytes,
-            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+        thread_ctx[i].a = aligned_alloc(pg_size, 3 * bytes);
+//             mmap(NULL, 3 * bytes,
+//             PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         thread_ctx[i].b = (char *)thread_ctx[i].a + bytes;
         thread_ctx[i].c = (char *)thread_ctx[i].b + bytes;
-        thread_ctx[i].d = (char *)thread_ctx[i].c + bytes;
-        // set_data(thread_ctx[i].a, 4 * bytes);
+        set_data(thread_ctx[i].a, 3 * bytes);
     }
 
-    // stream->a = aligned_alloc(pg_size, stream->maxbytes);
-    // stream->b = aligned_alloc(pg_size, stream->maxbytes);
+//     stream->a = aligned_alloc(pg_size, stream->maxbytes);
+//     stream->b = aligned_alloc(pg_size, stream->maxbytes);
+//     stream->c = aligned_alloc(pg_size, stream->maxbytes);
 
-    // set_data(stream->a, stream->maxbytes);
-    // set_data(stream->b, bytes);
-    
+//     set_data(stream->a, stream->maxbytes);
+//     set_data(stream->b, stream->maxbytes);
+//     set_data(stream->c, stream->maxbytes);
+
     print_header(stream);
 
     for (size_t count = stream->mincount; count <= stream->maxcount; count *= 2)
@@ -357,13 +349,13 @@ int main(int argc, char **argv)
     }
 
     for (int i = 0; i < stream->threads; i++) {
-        munmap(thread_ctx[i].a, stream->maxbytes/stream->threads);
-        munmap(thread_ctx[i].b, stream->maxbytes/stream->threads);
-        // munmap(thread_ctx[i].c, stream->maxbytes/stream->threads);
+//         munmap(thread_ctx[i].a, stream->maxbytes/stream->threads);
+        free(thread_ctx[i].a);
     }
 
-    // free(stream->a);
-    // free(stream->b);
+//     free(stream->a);
+//     free(stream->b);
+//     free(stream->c);
 
     return 0;
 }

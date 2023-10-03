@@ -20,6 +20,9 @@ DTYPE scalar = 1.234;
 #define WAIT    0
 #define RUN     1
 
+#define min(a,b) ((a) < (b) ? (a) : (b))
+
+#define _256KB 262144
 typedef struct thread_ctx_t thread_ctx_t;
 
 /* Define Stream Benchmarks */
@@ -28,6 +31,28 @@ typedef void (*stream_fn)(DTYPE *, DTYPE *, DTYPE *, size_t, thread_ctx_t *);
 typedef struct thread_sync_t {
     volatile uint64_t v[16]; //128 bytes
 } thread_sync_t;
+
+typedef struct pipe_buff_s {
+    ucs_status_ptr_t ucp_req;
+    void *accbuf;
+    void *getbuf;
+    void *tmpbuf;
+    size_t count;
+    size_t status;
+} pipe_buff_t;
+
+typedef struct pipe_s {
+    pipe_buff_t *buffs;
+    size_t num_buffs;
+    size_t buff_sz_count;
+    size_t buff_sz_bytes;
+    size_t count_rem;
+    size_t r_idx;
+    size_t g_idx;
+    size_t g_byte_offset;
+    size_t g_count_rem;
+    size_t buffs_avail;
+} pipe_t;
 
 typedef struct stream_mem_rkey_t
 {
@@ -41,21 +66,22 @@ typedef struct stream_mem_t
     ucp_mem_h memh;
     stream_mem_rkey_t rkey;
     void *rem_base;
-    ucp_rkey_h rem_rkey;
+    ucp_rkey_h *rem_rkey;
 } stream_mem_t;
 
 typedef struct _stream_ucx_t
 {
     /* Local UCX stuff */
     ucp_context_h ucp_ctx;
-    ucp_worker_h ucp_worker;
-    ucp_worker_attr_t worker_attr;
-    ucp_request_param_t req_param;
+    ucp_worker_h *ucp_worker;
+    ucs_status_ptr_t *ucp_req;
+    ucp_worker_attr_t *worker_attr;
+    ucp_request_param_t *req_param;
 
     /* Remote UCX stuff */
     void *rem_worker_addr;
     size_t rem_worker_addr_len;
-    ucp_ep_h remote_ep;
+    ucp_ep_h *remote_ep;
 
     stream_fn fn;
     stream_mem_t buffer_a;
@@ -66,14 +92,11 @@ typedef struct _stream_ucx_t
     int threads;
     int rank;
     int size;
-    
     size_t mincount;
     size_t maxcount;
     size_t maxbytes;
     int iters;
     size_t count;
-    double t_get_end;
-
     char rem_rkey_buf[MAX_RKEY_LEN];
 } stream_ucx_t;
 
@@ -81,6 +104,8 @@ typedef struct thread_ctx_t {
     int idx;
     pthread_t id;
     stream_ucx_t *stream_net;
+    pipe_t pipe;
+    double t_reduce;
 } thread_ctx_t;
 
 /* Utility Functions */
@@ -120,7 +145,7 @@ int get_num_iters(size_t nbytes)
         iters = 1e1;
     if (nbytes > 1e9)
         iters = 1e0;
-    return iters * 10;
+    return iters * 10; // * 1000;
 }
 
 /* Compute Functions Based on STREAM Benchmark */
@@ -190,12 +215,7 @@ typedef struct benchmark
 } benchmark;
 
 benchmark benchmarks[] = {
-    {"copy", 2, stream_copy},
-    {"scale", 2, stream_scale},
-    {"add", 3, stream_add},
-    {"triad", 3, stream_triad},
-    {"reduce", 1, stream_reduce},
-    {"get-reduce", 1, stream_reduce_get},
+    {"get-red", 1, stream_reduce_get},
 };
 
 ucs_status_t ucx_request_wait(ucp_worker_h ucp_worker, ucs_status_ptr_t request)
@@ -261,12 +281,84 @@ static void thread_set_affinity(thread_ctx_t *ctx)
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
 
+    int i=0, j=0;
     CPU_SET(ctx->idx * places, &cpuset);
 
-    pthread_setaffinity_np(thread, sizeof(cpuset), &cpuset); 
+    pthread_setaffinity_np(thread, sizeof(cpuset), &cpuset);
+    //printf ("Thread %d/%d set affinity to %d\n", ctx->idx, ctx->stream_net->threads, ctx->idx * places);
 }
 
-double stream_root_thread(void *arg) {
+void rdma_read(thread_ctx_t *thread_ctx) {
+    ucp_request_param_t req_param = {};
+    pipe_t *pipe = &thread_ctx->pipe;
+    stream_ucx_t *stream_net = thread_ctx->stream_net;
+    size_t g_idx = pipe->g_idx % pipe->num_buffs;
+
+    DTYPE *b = NULL;
+    b = stream_net->buffer_b.base;
+
+    if (pipe->buffs[g_idx].status == 0 &&
+        pipe->buffs_avail && pipe->g_count_rem)
+    {
+        size_t count = min(pipe->buff_sz_count, pipe->g_count_rem);
+        size_t bytes = count * sizeof(DTYPE);
+        size_t byte_offset = pipe->g_byte_offset;
+        pipe->buffs[g_idx].ucp_req =
+            ucp_get_nbx(stream_net->remote_ep[thread_ctx->idx], pipe->buffs[g_idx].getbuf, bytes,
+                        (uint64_t)(stream_net->buffer_b.rem_base + byte_offset),
+                        stream_net->buffer_b.rem_rkey[thread_ctx->idx], &req_param);
+
+        pipe->buffs[g_idx].count = count;
+        pipe->buffs[g_idx].status = 1;
+        pipe->g_byte_offset += bytes;
+        pipe->g_count_rem -= count;
+        pipe->g_idx++;
+        pipe->buffs_avail--;
+    }
+}
+
+void compute_kernel(thread_ctx_t *thread_ctx)
+{
+    stream_ucx_t *stream_net = thread_ctx->stream_net;
+    pipe_t *pipe = &thread_ctx->pipe;
+    size_t count = 0;
+    size_t r_idx = pipe->r_idx % pipe->num_buffs;
+    ucs_status_ptr_t req = pipe->buffs[r_idx].ucp_req;
+    double t1 = 0.0;
+
+    // DTYPE   *a = stream_net->buffer_a.base,
+    //         *b = stream_net->buffer_b.base,
+    //         *c = stream_net->buffer_c.base;
+
+    if (pipe->r_idx <= pipe->g_idx &&
+        pipe->buffs[r_idx].status == 1
+        && req != NULL && UCS_INPROGRESS != ucp_request_check_status(req))
+    {
+        t1 = gettimeus();
+
+        ucp_request_free(req);
+        pipe->buffs[r_idx].ucp_req = NULL;
+        
+        count = pipe->buffs[r_idx].count;
+
+        (stream_net->fn)(pipe->buffs[r_idx].accbuf,
+                        pipe->buffs[r_idx].tmpbuf,
+                        NULL, count, thread_ctx);
+        pipe->buffs[r_idx].status = 0;
+        pipe->r_idx++;
+        pipe->count_rem-=count;
+        pipe->buffs_avail++;
+
+
+        thread_ctx->t_reduce += gettimeus() - t1;
+    }
+
+    return;
+}
+
+
+double stream_root_thread(void *arg)
+{
     ucs_status_t status;
     ucs_status_ptr_t ucp_req = UCS_OK;
     ucp_request_param_t req_param = {};
@@ -275,153 +367,155 @@ double stream_root_thread(void *arg) {
     stream_ucx_t *stream_net = thread_ctx->stream_net;
     thread_sync_t *thread_sync = stream_net->thread_sync;
 
-    thread_set_affinity(thread_ctx);
+    size_t count = stream_net->count / stream_net->threads;
+    size_t offset = thread_ctx->idx * count;
+    size_t bytes = count * sizeof(DTYPE);
+    size_t byte_offset = thread_ctx->idx * bytes;
+
+    double  t_start = 0.0, t_end = 0.0;
+    int tidx = thread_ctx->idx;
+    thread_ctx->t_reduce = 0.0;
 
     DTYPE   *a = stream_net->buffer_a.base,
             *b = stream_net->buffer_b.base,
             *c = stream_net->buffer_c.base;
 
-    int tidx = thread_ctx->idx;
-    int iters = stream_net->iters;
-    int j;
-    size_t count = stream_net->count / stream_net->threads;
-
-    double t_get_start = 0.0, t_get_end = 0.0;
-    stream_net->t_get_end = 0.0;
-
-    DTYPE *tmp_get = aligned_alloc(sysconf(_SC_PAGESIZE), stream_net->maxbytes),
-          *tmp_acc = aligned_alloc(sysconf(_SC_PAGESIZE), stream_net->maxbytes);
+    thread_set_affinity(thread_ctx);
 
     /* warm up */
-    for (j = 0; j < 10; j++) {
+    for (int i = 0; i < 10; i++) {
         release_peer_threads(thread_sync, stream_net->threads);
-        ucp_req = ucp_get_nbx(stream_net->remote_ep, b, stream_net->count * sizeof(DTYPE),
-                (uint64_t)stream_net->buffer_b.rem_base,
-                stream_net->buffer_b.rem_rkey, &req_param);
-        status = ucx_request_wait(stream_net->ucp_worker, ucp_req);
+        ucp_req = ucp_get_nbx(
+                stream_net->remote_ep[tidx],
+                thread_ctx->pipe.buffs[0].getbuf, thread_ctx->pipe.buff_sz_bytes,
+                (uint64_t)stream_net->buffer_b.rem_base, stream_net->buffer_b.rem_rkey[tidx],
+                &req_param);
+        status = ucx_request_wait(stream_net->ucp_worker[tidx], ucp_req);
         wait_for_peer_threads(thread_sync, stream_net->threads);
     }
 
-    double t_start = gettimeus();
-    for (j = 0; j < iters; j++)
+    t_start = gettimeus();
+    for (int i = 0; i < stream_net->iters; i++)
     {
-        /* Get the data */
-        #if 1
-        t_get_start = gettimeus();
-        ucp_req = ucp_get_nbx(stream_net->remote_ep, b, stream_net->count * sizeof(DTYPE),
-                        (uint64_t)stream_net->buffer_b.rem_base,
-                        stream_net->buffer_b.rem_rkey, &req_param);
-        status = ucx_request_wait(stream_net->ucp_worker, ucp_req);
-        t_get_end += gettimeus() - t_get_start;        
-        #endif
-        /* ---- */
+        /* reset/init counters */
+        thread_ctx->pipe.count_rem = count;
+        thread_ctx->pipe.r_idx = 0; 
+        thread_ctx->pipe.g_idx = 0;
+        thread_ctx->pipe.g_byte_offset = byte_offset;
+        thread_ctx->pipe.g_count_rem = count;
+        thread_ctx->pipe.buffs_avail = thread_ctx->pipe.num_buffs;
 
         release_peer_threads(thread_sync, stream_net->threads);
+        while(thread_ctx->pipe.count_rem > 0) {
+            
+            /* try to get buffer */
+            rdma_read(thread_ctx);
 
-        (stream_net->fn)(a, b, c, count, thread_ctx);
+            /* try to reduce buffer */
+            compute_kernel(thread_ctx);
 
+            /* progress */
+            while(ucp_worker_progress(stream_net->ucp_worker[tidx])) { }
+        }
         wait_for_peer_threads(thread_sync, stream_net->threads);
     }
-    double t_end = gettimeus();
-    free(tmp_get);
-    free(tmp_acc);
-    return t_end - t_start;// - t_get_end;
+    t_end = gettimeus();
+
+    return t_end - t_start;
 }
 
 void *stream_peer_thread(void *arg) {
+    ucs_status_t status;
+    ucs_status_ptr_t ucp_req = UCS_OK;
+    ucp_request_param_t req_param = {};
+
     thread_ctx_t *thread_ctx = (thread_ctx_t *)arg;
     stream_ucx_t *stream_net = thread_ctx->stream_net;
     thread_sync_t *sync = stream_net->thread_sync;
 
-    int iters = stream_net->iters;
     size_t count = stream_net->count / stream_net->threads;
-    //size_t count_offset = stream_net->maxcount / stream_net->threads; // ->idx * count;
-    size_t count_offset = thread_ctx->idx * count;
-    // printf ("thread [%d], count = %d at offset%d\n", thread_ctx->idx, count, count_offset);
-
-    thread_set_affinity(thread_ctx);
+    size_t bytes = count * sizeof(DTYPE);
+    size_t byte_offset = thread_ctx->idx * bytes;
+    int tidx = thread_ctx->idx;
+    int iters = stream_net->iters;
 
     DTYPE   *a = stream_net->buffer_a.base,
             *b = stream_net->buffer_b.base,
             *c = stream_net->buffer_c.base;
 
-    DTYPE *tmp_get = aligned_alloc(sysconf(_SC_PAGESIZE), stream_net->maxbytes),
-          *tmp_acc = aligned_alloc(sysconf(_SC_PAGESIZE), stream_net->maxbytes);
+    thread_set_affinity(thread_ctx);
 
     /* warm up*/
     for (int j = 0; j < 10; j++) {
         while (stream_net->thread_sync[thread_ctx->idx].v[PEER] == WAIT) {
         }
         stream_net->thread_sync[thread_ctx->idx].v[PEER] = WAIT;
+        ucp_req = ucp_get_nbx(stream_net->remote_ep[tidx],
+                thread_ctx->pipe.buffs[0].getbuf, thread_ctx->pipe.buff_sz_bytes,
+                        (uint64_t)(stream_net->buffer_b.rem_base + byte_offset),
+                        stream_net->buffer_b.rem_rkey[tidx], &req_param);
+        status = ucx_request_wait(stream_net->ucp_worker[tidx], ucp_req);
         stream_net->thread_sync[thread_ctx->idx].v[ROOT] = WAIT;
     }
 
-    // compute
+    // run all iterations
     for (int j = 0; j < iters; j++)
     {
+        /* reset/init counters */
+        thread_ctx->pipe.count_rem = count;
+        thread_ctx->pipe.r_idx = 0;
+        thread_ctx->pipe.g_idx = 0;
+        thread_ctx->pipe.g_byte_offset = byte_offset;
+        thread_ctx->pipe.g_count_rem = count;
+        thread_ctx->pipe.buffs_avail = thread_ctx->pipe.num_buffs;
+
         /*wait for root thread*/
-        while (stream_net->thread_sync[thread_ctx->idx].v[PEER] == WAIT) {
+        while (stream_net->thread_sync[tidx].v[PEER] == WAIT) {
         }
-        stream_net->thread_sync[thread_ctx->idx].v[PEER] = WAIT;
+        stream_net->thread_sync[tidx].v[PEER] = WAIT;
 
-         (stream_net->fn)(&a[count_offset], &b[count_offset], &c[count_offset],
-             count, thread_ctx);
+        while (thread_ctx->pipe.count_rem > 0) {
+            /* try to get buffer */
+            rdma_read(thread_ctx);
 
-        stream_net->thread_sync[thread_ctx->idx].v[ROOT] = WAIT;
+            /* try to reduce buffer */
+            compute_kernel(thread_ctx);
+
+            /* progress */
+            while(ucp_worker_progress(stream_net->ucp_worker[tidx])) { }
+        }
+
+        /* Signal root */
+        stream_net->thread_sync[tidx].v[ROOT] = WAIT;
     }
-    
-    free(tmp_get);
-    free(tmp_acc);
 }
 
 /* Report Raw Latency in Microsecond from Individual Benchmarks */
-double run_bench(stream_fn fn, DTYPE *a, DTYPE *b, DTYPE *c, size_t count, int iters,
-    thread_ctx_t *thread_ctx)
+double run_bench(stream_fn fn, size_t count, int iters, thread_ctx_t *thread_ctx)
 {
-    double t_end = 0.0, t_start = 0.0;
     stream_ucx_t *stream_net = thread_ctx->stream_net;
     stream_net->count = count;
     stream_net->iters = iters;
     stream_net->fn = fn;
 
-    // printf ("count = %d\n", count);
-
     if (stream_net->rank > 0) {
         return 0.0;
     }
-
-    // sleep(20);
     
-    /* Ignore first iteration */
-    if (thread_ctx->idx == 0) {
-        (fn)(a, b, c, count, thread_ctx);
-    }
-
     double lat_us = 0.0;
-    if (fn == stream_reduce_get) {
 
-        for (int i = 1; i < stream_net->threads; i++) {
-            pthread_create(&thread_ctx[i].id, NULL, stream_peer_thread, &thread_ctx[i]);
-        }
-
-        // t_start = gettimeus();
-        lat_us = stream_root_thread((void *)&thread_ctx[0]);
-        // t_end = gettimeus();// - stream_net->t_get_end;
-
-        for (size_t i = 1; i < stream_net->threads; i++) {
-            pthread_join(thread_ctx[i].id, NULL);
-        }
-    }
-    else {
-        // t_start = gettimeus();
-        for (int j = 0; j < iters; j++)
-        {
-            (fn)(a, b, c, count, thread_ctx);
-        }
-        // t_end = gettimeus();
+    for (int i = 1; i < stream_net->threads; i++) {
+        pthread_create(&thread_ctx[i].id, NULL, stream_peer_thread, &thread_ctx[i]);
     }
 
-    // double lat_us = (t_end - t_start) / iters;
+    lat_us = stream_root_thread((void *)&thread_ctx[0]);
+
+    for (size_t i = 1; i < stream_net->threads; i++) {
+        pthread_join(thread_ctx[i].id, NULL);
+    }
+ 
+
+    thread_ctx[0].t_reduce = thread_ctx[0].t_reduce / iters;
     return lat_us / iters;
 }
 
@@ -436,7 +530,7 @@ void print_header()
     int num_bench = sizeof(benchmarks) / sizeof(benchmarks[0]);
     for (int i = num_bench-1; i < num_bench; i++)
     {
-        printf("%11s", benchmarks[i].name);
+        printf("%15s%s %15s %15s %15s", benchmarks[i].name, "(GB/s)", "get-red(usec)", "red(GB/s)", "red(usec)");
     }
     printf("\n");
 }
@@ -468,34 +562,39 @@ static int stream_ucx_init(stream_ucx_t *stream_net)
         goto err;
     }
 
-    memset(&worker_params, 0, sizeof(worker_params));
-    worker_params.field_mask = UCP_WORKER_PARAM_FIELD_THREAD_MODE;
-    worker_params.thread_mode = UCS_THREAD_MODE_MULTI;
+    for (int i = 0; i < stream_net->threads; i+=2) {
+        memset(&worker_params, 0, sizeof(worker_params));
+        worker_params.field_mask = UCP_WORKER_PARAM_FIELD_THREAD_MODE;
+        worker_params.thread_mode = UCS_THREAD_MODE_MULTI;
 
-    status = ucp_worker_create (
-            stream_net->ucp_ctx, &worker_params, &stream_net->ucp_worker);
-    if (status != UCS_OK)
-    {
-        fprintf(stderr, "failed to create ucp_worker (%s)\n", ucs_status_string(status));
-        ret = UCS_ERR_NO_MESSAGE;
-        goto err_cleanup;
-    }
+        status = ucp_worker_create(stream_net->ucp_ctx, &worker_params, &stream_net->ucp_worker[i]);
+        if (status != UCS_OK)
+        {
+            fprintf(stderr, "failed to create ucp_worker (%s)\n", ucs_status_string(status));
+            ret = UCS_ERR_NO_MESSAGE;
+            goto err_cleanup;
+        }
 
-    stream_net->worker_attr.field_mask = UCP_WORKER_ATTR_FIELD_ADDRESS |
-                                        UCP_WORKER_ATTR_FIELD_ADDRESS_FLAGS;
-    stream_net->worker_attr.address_flags = UCP_WORKER_ADDRESS_FLAG_NET_ONLY;
-    status = ucp_worker_query(stream_net->ucp_worker, &stream_net->worker_attr);
-    if (UCS_OK != status) {
-        fprintf(stderr, "failed to ucp_worker_query (%s)\n", ucs_status_string(status));
-        ret = UCS_ERR_NO_MESSAGE;
-        goto err_worker;
+        stream_net->worker_attr[i].field_mask = UCP_WORKER_ATTR_FIELD_ADDRESS |
+                                            UCP_WORKER_ATTR_FIELD_ADDRESS_FLAGS;
+        stream_net->worker_attr[i].address_flags = UCP_WORKER_ADDRESS_FLAG_NET_ONLY;
+        status = ucp_worker_query(stream_net->ucp_worker[i], &stream_net->worker_attr[i]);
+        if (UCS_OK != status) {
+            fprintf(stderr, "failed to ucp_worker_query (%s)\n", ucs_status_string(status));
+            ret = UCS_ERR_NO_MESSAGE;
+            goto err_worker;
+        }
+
+        /* copy worker, 2threads/worker */
+        stream_net->ucp_worker[i+1]  = stream_net->ucp_worker[i];
+        stream_net->worker_attr[i+1] = stream_net->worker_attr[i];
     }
 
     return ret;
 err_worker:
-
-    ucp_worker_destroy(stream_net->ucp_worker);
-
+    for (int i = 0; i < stream_net->threads; i+=2) {
+        ucp_worker_destroy(stream_net->ucp_worker[i]);
+    }
 err_cleanup:
     ucp_cleanup(stream_net->ucp_ctx);
 err:
@@ -508,14 +607,14 @@ static int stream_connect_workers(stream_ucx_t *stream_net)
     MPI_Status mpi_status;
 
     MPI_Sendrecv(
-        &stream_net->worker_attr.address_length, sizeof(size_t), MPI_BYTE, !stream_net->rank, 0,
+        &stream_net->worker_attr[0].address_length, sizeof(size_t), MPI_BYTE, !stream_net->rank, 0,
         &stream_net->rem_worker_addr_len, sizeof(size_t), MPI_BYTE, !stream_net->rank, 0,
         MPI_COMM_WORLD, &mpi_status);
 
     stream_net->rem_worker_addr = calloc(1, stream_net->rem_worker_addr_len);
 
     MPI_Sendrecv(
-        stream_net->worker_attr.address, stream_net->worker_attr.address_length, MPI_BYTE,
+        stream_net->worker_attr[0].address, stream_net->worker_attr[0].address_length, MPI_BYTE,
             !stream_net->rank, 0, 
             stream_net->rem_worker_addr, stream_net->rem_worker_addr_len, MPI_BYTE,
             !stream_net->rank, 0, MPI_COMM_WORLD, &mpi_status);
@@ -530,10 +629,12 @@ static int stream_connect_workers(stream_ucx_t *stream_net)
     ep_params.err_handler.cb = err_cb;
     ep_params.address = stream_net->rem_worker_addr;
 
-    status = ucp_ep_create(stream_net->ucp_worker, &ep_params, &stream_net->remote_ep);
-    if (status != UCS_OK) {
-        fprintf(stderr, "!!! failed to create endpoint to remote %d (%s)\n",
-                status, ucs_status_string(status));
+    for (int i = 0; i < stream_net->threads; i++) {
+        status = ucp_ep_create(stream_net->ucp_worker[i], &ep_params, &stream_net->remote_ep[i]);
+        if (status != UCS_OK) {
+            fprintf(stderr, "!!! failed to create endpoint to remote %d (%s)\n",
+                    status, ucs_status_string(status));
+        }
     }
 
     free(stream_net->rem_worker_addr);
@@ -543,8 +644,13 @@ static int stream_connect_workers(stream_ucx_t *stream_net)
 static void stream_buffer_free(stream_ucx_t *stream_net, stream_mem_t *mem)
 {
     ucp_rkey_buffer_release(mem->rkey.rkey_buf);
-    ucp_rkey_destroy(mem->rem_rkey);
     ucp_mem_unmap(stream_net->ucp_ctx, mem->memh);
+    for (int i = 0; i < stream_net->threads; i++) {
+        ucp_rkey_destroy(mem->rem_rkey[i]);
+    }
+
+    free(mem->rem_rkey);
+
     mem->base = NULL;
 }
 
@@ -572,12 +678,14 @@ static int exchange_rkeys(stream_ucx_t *stream_net, stream_mem_t *buffer)
                  &tmp_rkey_rem, MAX_RKEY_LEN, MPI_BYTE, !stream_net->rank, 0,
                  MPI_COMM_WORLD, &mpi_status);
 
-    status = ucp_ep_rkey_unpack(stream_net->remote_ep,
-                (void *)tmp_rkey_rem, &buffer->rem_rkey);
-    if (status != UCS_OK)
-    {
-        fprintf(stderr, "unable to unpack key!\n");
-        return 1;
+    for (int i = 0; i < stream_net->threads; i++) {
+        status = ucp_ep_rkey_unpack(stream_net->remote_ep[i],
+                    (void *)tmp_rkey_rem, &buffer->rem_rkey[i]);
+        if (status != UCS_OK)
+        {
+            fprintf(stderr, "unable to unpack key!\n");
+            return 1;
+        }
     }
 
     return 0;
@@ -629,13 +737,17 @@ static void stream_register_buffer(stream_ucx_t *stream_net, DTYPE *buffer,
     }
     assert(mem->rkey.rkey_buf_len < MAX_RKEY_LEN);
 
+    mem->rem_rkey = calloc(stream_net->threads, sizeof(ucp_rkey_h));
+
     return;
 }
 
 static int stream_ucx_fini(stream_ucx_t *stream_net)
 {
-    ucp_worker_release_address(stream_net->ucp_worker, stream_net->worker_attr.address);
-    ucp_worker_destroy(stream_net->ucp_worker);
+    for (int i = 0; i < stream_net->threads; i+=2) {
+        ucp_worker_release_address(stream_net->ucp_worker[i], stream_net->worker_attr[i].address);
+        ucp_worker_destroy(stream_net->ucp_worker[i]);
+    }
     ucp_cleanup(stream_net->ucp_ctx);
 }
 
@@ -653,19 +765,36 @@ int main(int argc, char **argv)
 
     stream_ucx_t *stream_net = calloc(1, sizeof(stream_ucx_t));
     env = getenv("STREAM_THREADS");
-    stream_net->threads = (env == NULL) ? 0 : atoi(env);
+    stream_net->threads = (env == NULL) ? 1 : atoi(env);
     stream_net->thread_sync = calloc(stream_net->threads, sizeof(thread_sync_t));
+    stream_net->ucp_worker = calloc(stream_net->threads, sizeof(ucp_worker_h));
+    stream_net->worker_attr = calloc(stream_net->threads, sizeof(ucp_worker_attr_t));
+    stream_net->remote_ep = calloc(stream_net->threads, sizeof(ucp_ep_h));
     stream_net->buffer_a.rem_rkey = calloc(stream_net->threads, sizeof(ucp_rkey_h));
     stream_net->buffer_b.rem_rkey = calloc(stream_net->threads, sizeof(ucp_rkey_h));
     stream_net->buffer_c.rem_rkey = calloc(stream_net->threads, sizeof(ucp_rkey_h));
 
     thread_ctx_t *thread_ctx = calloc(stream_net->threads, sizeof(thread_ctx_t));
+    env = getenv("STREAM_NUM_BUFFS");
+    size_t stream_num_buffs = (env == NULL) ? 2 : atoi(env);
+
+    env = getenv("STREAM_BUFF_SIZE");
+    size_t stream_buff_size = (env == NULL) ? _256KB : atoi(env);
+    size_t stream_buff_sz_count = stream_buff_size / sizeof(DTYPE);
+    size_t buffs_total_count = stream_buff_sz_count * stream_num_buffs;
+    size_t buffs_total_size = stream_net->threads * buffs_total_count * sizeof(DTYPE);
+
+    printf ("STERAM_NUM_BUFFS = %d; STREAM_BUFF_SIZE = %d; STREAM_BUFF_SZ_COUNT = %d\n",
+        stream_num_buffs, stream_buff_size, stream_buff_sz_count);
+
     for (int i = 0; i < stream_net->threads; i++) {
         thread_ctx[i].stream_net = stream_net;
         thread_ctx[i].idx = i;
+        thread_ctx[i].pipe.num_buffs = stream_num_buffs;
+        thread_ctx[i].pipe.buff_sz_count = stream_buff_size / sizeof(DTYPE);
+        thread_ctx[i].pipe.buff_sz_bytes = stream_buff_size;
+        thread_ctx[i].pipe.buffs = calloc(stream_num_buffs, sizeof(pipe_buff_t));
     }
-
-    // sleep(20);
 
     MPI_Init(NULL, NULL);
     MPI_Comm_rank(MPI_COMM_WORLD, &stream_net->rank);
@@ -679,7 +808,7 @@ int main(int argc, char **argv)
 
     size_t pg_size = sysconf(_SC_PAGESIZE);
     stream_net->mincount = (1 << 12) / sizeof(DTYPE);
-    stream_net->maxcount = (1 << 22) / sizeof(DTYPE);
+    stream_net->maxcount = (1 << 27) / sizeof(DTYPE);
     stream_net->maxbytes = stream_net->maxcount * sizeof(DTYPE);
 
     DTYPE *a = aligned_alloc(pg_size, stream_net->maxbytes);
@@ -690,9 +819,19 @@ int main(int argc, char **argv)
     set_data(b, stream_net->maxbytes);
     set_data(c, stream_net->maxbytes);
 
+    for (int i = 0; i < stream_net->threads; i++) {
+        DTYPE *tmpbuf = aligned_alloc(pg_size, stream_buff_size * stream_num_buffs * 3);
+        set_data(tmpbuf, stream_buff_size * stream_num_buffs * 3);
+        for (int j = 0; j < stream_num_buffs; j++) {
+            thread_ctx[i].pipe.buffs[j].accbuf = (void *)&tmpbuf[j * stream_buff_sz_count];
+            thread_ctx[i].pipe.buffs[j].getbuf = (void *)&tmpbuf[(stream_buff_sz_count * stream_num_buffs) + (j * stream_buff_sz_count)];
+            thread_ctx[i].pipe.buffs[j].tmpbuf = (void *)&tmpbuf[(stream_buff_sz_count * stream_num_buffs * 2) + (j * stream_buff_sz_count)];
+        }
+    }
+
     if (UCS_OK != stream_ucx_init(stream_net))
     {
-        fprintf(stderr, "Error in UCX init!\n");
+        fprintf(stdout, "Error in UCX init!\n");
     }
     stream_connect_workers(stream_net);
     stream_register_buffer(stream_net, a, &stream_net->buffer_a, stream_net->maxbytes);
@@ -703,9 +842,11 @@ int main(int argc, char **argv)
     exchange_rkeys(stream_net, &stream_net->buffer_b);
     exchange_rkeys(stream_net, &stream_net->buffer_c);
 
-    memset(&req_param, 0, sizeof(ucp_request_param_t));
-    ucp_req = ucp_worker_flush_nbx(stream_net->ucp_worker, &req_param);
-    status = ucx_request_wait(stream_net->ucp_worker, ucp_req);        
+    for (int i = 0; i < stream_net->threads; i++) {
+        memset(&req_param, 0, sizeof(ucp_request_param_t));
+        ucp_req = ucp_worker_flush_nbx(stream_net->ucp_worker[i], &req_param);
+        status = ucx_request_wait(stream_net->ucp_worker[i], ucp_req);        
+    }
 
     MPI_Request mpi_request;
     MPI_Status mpi_status;
@@ -724,17 +865,16 @@ int main(int argc, char **argv)
             printf("%-8d %-12ld", iters, nbytes);
 
         int num_bench = sizeof(benchmarks) / sizeof(benchmarks[0]);
-        // for (int i = 0; i < num_bench; i++)
         for (int i = num_bench-1; i < num_bench; i++)
         {
             benchmark bench = benchmarks[i];
-            lat_us = run_bench(bench.fn,
-                stream_net->buffer_a.base, stream_net->buffer_b.base, stream_net->buffer_c.base,
-                count, iters, thread_ctx);
+            lat_us = run_bench(bench.fn, count, iters, thread_ctx);
             double bw_GBs = 1e-3 * nbytes / lat_us;
+            double red_GBs = 1e-3 * nbytes / thread_ctx[0].t_reduce;
             bw_GBs *= bench.num_vectors;
+            red_GBs *= bench.num_vectors; 
             if (stream_net->rank == 0)
-                printf("%11.2lf", bw_GBs);
+                printf("%15.2lf %15.2lf %15.2lf %15.2lf", bw_GBs, lat_us, red_GBs, thread_ctx[0].t_reduce);
         }
         if (stream_net->rank == 0)
             printf("\n");
@@ -751,6 +891,19 @@ int main(int argc, char **argv)
     free(a);
     free(b);
     free(c);
+
+        
+    for (int i = 0; i < stream_net->threads; i++) {
+        // for (int j = 0; j < stream_num_buffs; j++) {
+            free(thread_ctx[i].pipe.buffs[0].accbuf);
+        // }
+    }
+    free(stream_net->thread_sync);
+    free(stream_net->remote_ep);
+    free(stream_net->worker_attr);
+    free(stream_net->ucp_worker);
+    free(thread_ctx);
+    free(stream_net);
 
     MPI_Finalize();
     return 0;
