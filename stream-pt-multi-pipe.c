@@ -36,7 +36,7 @@ typedef struct pipe_buff_s {
     ucs_status_ptr_t ucp_req;
     void *accbuf;
     void *getbuf;
-    void *tmpbuf;
+    //void *tmpbuf;
     size_t count;
     size_t status;
 } pipe_buff_t;
@@ -337,12 +337,13 @@ void compute_kernel(thread_ctx_t *thread_ctx)
         t1 = gettimeus();
 
         ucp_request_free(req);
+
         pipe->buffs[r_idx].ucp_req = NULL;
         
         count = pipe->buffs[r_idx].count;
 
         (stream_net->fn)(pipe->buffs[r_idx].accbuf,
-                        pipe->buffs[r_idx].tmpbuf,
+                        pipe->buffs[r_idx].getbuf,
                         NULL, count, thread_ctx);
         pipe->buffs[r_idx].status = 0;
         pipe->r_idx++;
@@ -784,7 +785,7 @@ int main(int argc, char **argv)
     size_t buffs_total_count = stream_buff_sz_count * stream_num_buffs;
     size_t buffs_total_size = stream_net->threads * buffs_total_count * sizeof(DTYPE);
 
-    printf ("STERAM_NUM_BUFFS = %d; STREAM_BUFF_SIZE = %d; STREAM_BUFF_SZ_COUNT = %d\n",
+    printf ("STERAM_NUM_BUFFS = %lu; STREAM_BUFF_SIZE = %lu; STREAM_BUFF_SZ_COUNT = %lu\n",
         stream_num_buffs, stream_buff_size, stream_buff_sz_count);
 
     for (int i = 0; i < stream_net->threads; i++) {
@@ -820,12 +821,12 @@ int main(int argc, char **argv)
     set_data(c, stream_net->maxbytes);
 
     for (int i = 0; i < stream_net->threads; i++) {
-        DTYPE *tmpbuf = aligned_alloc(pg_size, stream_buff_size * stream_num_buffs * 3);
-        set_data(tmpbuf, stream_buff_size * stream_num_buffs * 3);
+        DTYPE *tmpbuf = aligned_alloc(pg_size, stream_buff_size * stream_num_buffs * 2);
+        set_data(tmpbuf, stream_buff_size * stream_num_buffs * 2);
         for (int j = 0; j < stream_num_buffs; j++) {
             thread_ctx[i].pipe.buffs[j].accbuf = (void *)&tmpbuf[j * stream_buff_sz_count];
             thread_ctx[i].pipe.buffs[j].getbuf = (void *)&tmpbuf[(stream_buff_sz_count * stream_num_buffs) + (j * stream_buff_sz_count)];
-            thread_ctx[i].pipe.buffs[j].tmpbuf = (void *)&tmpbuf[(stream_buff_sz_count * stream_num_buffs * 2) + (j * stream_buff_sz_count)];
+            // thread_ctx[i].pipe.buffs[j].tmpbuf = (void *)&tmpbuf[(stream_buff_sz_count * stream_num_buffs * 2) + (j * stream_buff_sz_count)];
         }
     }
 

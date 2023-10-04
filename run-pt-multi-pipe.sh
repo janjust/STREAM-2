@@ -1,6 +1,6 @@
 #!/bin/bash
 
-hosts="heliosbf2a002:1,helios002 "
+hosts="bf-rock-17:1,rock17:1 "
 
 OPTS="-x STREAM_THREADS=$1 -x STREAM_NUM_BUFFS=$2 -x STREAM_BUFF_SIZE=$3 "
 
